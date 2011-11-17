@@ -1,5 +1,5 @@
 /*
- * This file was generated automatically by gen-mterp.py for 'armv5te-vfp'.
+ * This file was generated automatically by gen-mterp.py for 'armv6k-vfp'.
  *
  * --> DO NOT EDIT <--
  */

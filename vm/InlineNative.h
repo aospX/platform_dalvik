@@ -84,6 +84,7 @@ enum NativeInlineOps {
     INLINE_DOUBLE_TO_LONG_BITS = 19,
     INLINE_DOUBLE_TO_RAW_LONG_BITS = 20,
     INLINE_LONG_BITS_TO_DOUBLE = 21,
+    INLINE_EX_START = 100,
 };
 
 /*
@@ -91,6 +92,10 @@ enum NativeInlineOps {
  */
 const InlineOperation* dvmGetInlineOpsTable(void);
 int dvmGetInlineOpsTableLength(void);
+
+extern "C" InlineOperation* dvmGetInlineOpsTableEx(int *length);
+extern "C" InlineOp4Func dvmInlineOpsExFunc(int opcode);
+extern "C" int dvmInlineOpsExVerify(int opcode);
 
 /*
  * The table, exposed so we can access it with C inlines.  Prefer access
@@ -111,6 +116,9 @@ extern const InlineOperation gDvmInlineOpsTable[];
 INLINE bool dvmPerformInlineOp4Std(u4 arg0, u4 arg1, u4 arg2, u4 arg3,
     JValue* pResult, int opIndex)
 {
+    if (opIndex >= INLINE_EX_START)
+        return (*dvmInlineOpsExFunc(opIndex))(arg0, arg1, arg2, arg3, pResult);
+
     return (*gDvmInlineOpsTable[opIndex].func)(arg0, arg1, arg2, arg3, pResult);
 }
 
@@ -128,6 +136,9 @@ INLINE bool dvmPerformInlineOp4Std(u4 arg0, u4 arg1, u4 arg2, u4 arg3,
 INLINE bool dvmPerformInlineOp5Std(u4 arg0, u4 arg1, u4 arg2, u4 arg3,
     JValue* pResult, int opIndex, u4 arg4)
 {
+    if (opIndex >= INLINE_EX_START)
+        return ((InlineOp5Func)(*dvmInlineOpsExFunc(opIndex)))(arg0, arg1, arg2, arg3, pResult, arg4);
+
     return ((InlineOp5Func)(*gDvmInlineOpsTable[opIndex].func))(arg0, arg1, arg2, arg3, pResult, arg4);
 }
 
