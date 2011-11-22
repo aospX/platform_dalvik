@@ -372,6 +372,10 @@ void dvmDumpLIRInsn(LIR *arg, unsigned char *baseAddr)
             LOGD("-------- reconstruct dalvik PC : 0x%04x @ +0x%04x", dest,
                  lir->operands[1]);
             break;
+        case kArmPseudoPCReconstructionCellExtended:
+            LOGD("-------- reconstruct dalvik PC : 0x%04x @ +0x%04x (extended)\n", dest,
+                 lir->operands[1]);
+            break;
         case kArmPseudoPCReconstructionBlockLabel:
             /* Do nothing */
             break;

@@ -3929,6 +3929,31 @@ static void handleInvokePredictedChainingCell(CompilationUnit *cUnit)
     addWordData(cUnit, NULL, PREDICTED_CHAIN_COUNTER_INIT);
 }
 
+static void handlePCReconstructionExtended(CompilationUnit *cUnit)
+{
+    ArmLIR **pcrLabel =
+        (ArmLIR **) cUnit->pcReconstructionListExtended.elemList;
+    int numElems = cUnit->pcReconstructionListExtended.numUsed;
+    int i;
+    ArmLIR *exceptionBlock;
+    if(numElems>0){
+        exceptionBlock = (ArmLIR *)dvmCompilerNew(sizeof(ArmLIR), true);
+        exceptionBlock->opcode = kArmPseudoEHBlockLabel;
+        for (i = 0; i < numElems; i++) {
+            dvmCompilerAppendLIR(cUnit, (LIR *) pcrLabel[i]);
+            /* r0 = dalvik PC */
+            loadConstant(cUnit, r0, pcrLabel[i]->operands[0]);
+            genUnconditionalBranch(cUnit, exceptionBlock);
+        }
+        /* appened exception block after pcReconstruction blocks */
+        dvmCompilerAppendLIR(cUnit, (LIR *) exceptionBlock);
+        loadWordDisp(cUnit, r6SELF, offsetof(Thread,
+                    jitToInterpEntries.dvmJitToInterpPunt),
+                    r1);
+        opReg(cUnit, kOpBlx, r1);
+    }
+}
+
 /* Load the Dalvik PC into r0 and jump to the specified target */
 static void handlePCReconstruction(CompilationUnit *cUnit,
                                    ArmLIR *targetLabel)
@@ -3945,6 +3970,9 @@ static void handlePCReconstruction(CompilationUnit *cUnit,
     if (numElems) {
         newLIR0(cUnit, kThumbUndefined);
     }
+
+    /* handle pcReconstruction for extended MIRs */
+    handlePCReconstructionExtended(cUnit);
 
     for (i = 0; i < numElems; i++) {
         dvmCompilerAppendLIR(cUnit, (LIR *) pcrLabel[i]);
@@ -4229,12 +4257,12 @@ static void setupLoopEntryBlock(CompilationUnit *cUnit, BasicBlock *entry,
 {
     /* Set up the place holder to reconstruct this Dalvik PC */
     ArmLIR *pcrLabel = (ArmLIR *) dvmCompilerNew(sizeof(ArmLIR), true);
-    pcrLabel->opcode = kArmPseudoPCReconstructionCell;
+    pcrLabel->opcode = kArmPseudoPCReconstructionCellExtended;
     pcrLabel->operands[0] =
         (int) (cUnit->method->insns + entry->startOffset);
     pcrLabel->operands[1] = entry->startOffset;
     /* Insert the place holder to the growable list */
-    dvmInsertGrowableList(&cUnit->pcReconstructionList, (intptr_t) pcrLabel);
+    dvmInsertGrowableList(&cUnit->pcReconstructionListExtended, (intptr_t)pcrLabel);
 
     /*
      * Next, create two branches - one branch over to the loop body and the
@@ -4283,20 +4311,28 @@ static bool selfVerificationPuntOps(MIR *mir)
 }
 #endif
 
+__attribute__((weak)) void dvmCompilerCheckStats(CompilationUnit *cUnit)
+{
+    if (cUnit->printMe){
+        LOGV("extra size in ChainingCells: %d",cUnit->chainingCellExtraSize);
+        LOGV("number of extended PCReconstruction cells: %d",
+                                cUnit->pcReconstructionListExtended.numUsed);
+    }
+}
+
 void dvmCompilerMIR2LIR(CompilationUnit *cUnit)
 {
     /* Used to hold the labels of each block */
     ArmLIR *labelList =
         (ArmLIR *) dvmCompilerNew(sizeof(ArmLIR) * cUnit->numBlocks, true);
     ArmLIR *headLIR = NULL;
-    GrowableList chainingListByType[kChainingCellGap];
     int i;
 
     /*
      * Initialize various types chaining lists.
      */
     for (i = 0; i < kChainingCellGap; i++) {
-        dvmInitGrowableList(&chainingListByType[i], 2);
+        dvmInitGrowableList(&(cUnit->chainingListByType[i]), 2);
     }
 
     /* Clear the visited flag for each block */
@@ -4317,6 +4353,7 @@ void dvmCompilerMIR2LIR(CompilationUnit *cUnit)
         if (bb->visited == true) continue;
 
         labelList[i].operands[0] = bb->startOffset;
+        bb->blockLabelLIR = (LIR *) &labelList[i];
 
         if (bb->blockType >= kChainingCellGap) {
             if (bb->isFallThroughFromInvoke == true) {
@@ -4354,7 +4391,7 @@ void dvmCompilerMIR2LIR(CompilationUnit *cUnit)
                     labelList[i].opcode = kArmPseudoChainingCellNormal;
                     /* handle the codegen later */
                     dvmInsertGrowableList(
-                        &chainingListByType[kChainingCellNormal], i);
+                        &(cUnit->chainingListByType[kChainingCellNormal]), i);
                     break;
                 case kChainingCellInvokeSingleton:
                     labelList[i].opcode =
@@ -4363,7 +4400,7 @@ void dvmCompilerMIR2LIR(CompilationUnit *cUnit)
                         (int) bb->containingMethod;
                     /* handle the codegen later */
                     dvmInsertGrowableList(
-                        &chainingListByType[kChainingCellInvokeSingleton], i);
+                        &(cUnit->chainingListByType[kChainingCellInvokeSingleton]), i);
                     break;
                 case kChainingCellInvokePredicted:
                     labelList[i].opcode =
@@ -4377,14 +4414,14 @@ void dvmCompilerMIR2LIR(CompilationUnit *cUnit)
                     labelList[i].operands[0] = labelList[i].operands[1];
                     /* handle the codegen later */
                     dvmInsertGrowableList(
-                        &chainingListByType[kChainingCellInvokePredicted], i);
+                        &(cUnit->chainingListByType[kChainingCellInvokePredicted]), i);
                     break;
                 case kChainingCellHot:
                     labelList[i].opcode =
                         kArmPseudoChainingCellHot;
                     /* handle the codegen later */
                     dvmInsertGrowableList(
-                        &chainingListByType[kChainingCellHot], i);
+                        &(cUnit->chainingListByType[kChainingCellHot]), i);
                     break;
                 case kPCReconstruction:
                     /* Make sure exception handling block is next */
@@ -4407,7 +4444,7 @@ void dvmCompilerMIR2LIR(CompilationUnit *cUnit)
                         kArmPseudoChainingCellBackwardBranch;
                     /* handle the codegen later */
                     dvmInsertGrowableList(
-                        &chainingListByType[kChainingCellBackwardBranch],
+                        &(cUnit->chainingListByType[kChainingCellBackwardBranch]),
                         i);
                     break;
                 default:
@@ -4630,11 +4667,12 @@ gen_fallthrough:
     }
 
     /* Handle the chaining cells in predefined order */
+    cUnit->chainingCellExtraSize=0;
     for (i = 0; i < kChainingCellGap; i++) {
         size_t j;
-        int *blockIdList = (int *) chainingListByType[i].elemList;
+        int *blockIdList = (int *) (cUnit->chainingListByType[i].elemList);
 
-        cUnit->numChainingCells[i] = chainingListByType[i].numUsed;
+        cUnit->numChainingCells[i] = cUnit->chainingListByType[i].numUsed;
 
         /* No chaining cells of this type */
         if (cUnit->numChainingCells[i] == 0)
@@ -4643,7 +4681,7 @@ gen_fallthrough:
         /* Record the first LIR for a new type of chaining cell */
         cUnit->firstChainingLIR[i] = (LIR *) &labelList[blockIdList[0]];
 
-        for (j = 0; j < chainingListByType[i].numUsed; j++) {
+        for (j = 0; j < cUnit->chainingListByType[i].numUsed; j++) {
             int blockId = blockIdList[j];
             BasicBlock *chainingBlock =
                 (BasicBlock *) dvmGrowableListGetElement(&cUnit->blockList,
@@ -4654,7 +4692,6 @@ gen_fallthrough:
 
             /* Insert the pseudo chaining instruction */
             dvmCompilerAppendLIR(cUnit, (LIR *) &labelList[blockId]);
-
 
             switch (chainingBlock->blockType) {
                 case kChainingCellNormal:
@@ -4699,6 +4736,8 @@ gen_fallthrough:
 #endif
         opReg(cUnit, kOpBlx, r2);
     }
+
+    dvmCompilerCheckStats(cUnit);
 
     dvmCompilerApplyGlobalOptimizations(cUnit);
 
