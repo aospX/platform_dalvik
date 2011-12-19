@@ -196,18 +196,6 @@ static void checkStackSum(Thread* self) {
  * ===========================================================================
  */
 
-static inline Thread* self(JNIEnv* env) {
-    Thread* envSelf = ((JNIEnvExt*) env)->self;
-    // When emulating direct pointers with indirect references, it's critical
-    // that we use the correct per-thread indirect reference table.
-    Thread* self = gDvmJni.workAroundAppJniBugs ? dvmThreadSelf() : envSelf;
-    if (self != envSelf) {
-        LOGE("JNI ERROR: env->self != thread-self (%p vs. %p); auto-correcting",
-                envSelf, self);
-    }
-    return self;
-}
-
 /*
  * Entry/exit processing for all JNI calls.
  *
@@ -220,7 +208,18 @@ static inline Thread* self(JNIEnv* env) {
 class ScopedJniThreadState {
 public:
     explicit ScopedJniThreadState(JNIEnv* env) {
-        mSelf = ::self(env);
+        mSelf = ((JNIEnvExt*) env)->self;
+
+        if (UNLIKELY(gDvmJni.workAroundAppJniBugs)) {
+            // When emulating direct pointers with indirect references, it's critical
+            // that we use the correct per-thread indirect reference table.
+            Thread* self = gDvmJni.workAroundAppJniBugs ? dvmThreadSelf() : mSelf;
+            if (self != mSelf) {
+                LOGE("JNI ERROR: env->self != thread-self (%p vs. %p); auto-correcting", mSelf, self);
+                mSelf = self;
+            }
+        }
+
         CHECK_STACK_SUM(mSelf);
         dvmChangeStatus(mSelf, THREAD_RUNNING);
     }
@@ -230,7 +229,7 @@ public:
         COMPUTE_STACK_SUM(mSelf);
     }
 
-    Thread* self() {
+    inline Thread* self() {
         return mSelf;
     }
 
@@ -300,16 +299,6 @@ JNIEnvExt* dvmGetJNIEnvForThread() {
 }
 
 /*
- * Retrieve the ReferenceTable struct for the current thread.
- *
- * Going through "env" rather than dvmThreadSelf() is faster but will
- * get weird if the JNI code is passing the wrong JNIEnv around.
- */
-static inline IndirectRefTable* getLocalRefTable(JNIEnv* env) {
-    return &self(env)->jniLocalRefTable;
-}
-
-/*
  * Convert an indirect reference to an Object reference.  The indirect
  * reference may be local, global, or weak-global.
  *
@@ -319,7 +308,7 @@ static inline IndirectRefTable* getLocalRefTable(JNIEnv* env) {
  *
  * Note "env" may be NULL when decoding global references.
  */
-Object* dvmDecodeIndirectRef(JNIEnv* env, jobject jobj) {
+Object* dvmDecodeIndirectRef(Thread* self, jobject jobj) {
     if (jobj == NULL) {
         return NULL;
     }
@@ -327,8 +316,8 @@ Object* dvmDecodeIndirectRef(JNIEnv* env, jobject jobj) {
     switch (indirectRefKind(jobj)) {
     case kIndirectKindLocal:
         {
-            Object* result = getLocalRefTable(env)->get(jobj);
-            if (result == NULL) {
+            Object* result = self->jniLocalRefTable.get(jobj);
+            if (UNLIKELY(result == NULL)) {
                 LOGE("JNI ERROR (app bug): use of deleted local reference (%p)", jobj);
                 dvmAbort();
             }
@@ -340,7 +329,7 @@ Object* dvmDecodeIndirectRef(JNIEnv* env, jobject jobj) {
             IndirectRefTable* pRefTable = &gDvm.jniGlobalRefTable;
             ScopedPthreadMutexLock lock(&gDvm.jniGlobalRefLock);
             Object* result = pRefTable->get(jobj);
-            if (result == NULL) {
+            if (UNLIKELY(result == NULL)) {
                 LOGE("JNI ERROR (app bug): use of deleted global reference (%p)", jobj);
                 dvmAbort();
             }
@@ -354,7 +343,7 @@ Object* dvmDecodeIndirectRef(JNIEnv* env, jobject jobj) {
             Object* result = pRefTable->get(jobj);
             if (result == kClearedJniWeakGlobal) {
                 result = NULL;
-            } else if (result == NULL) {
+            } else if (UNLIKELY(result == NULL)) {
                 LOGE("JNI ERROR (app bug): use of deleted weak global reference (%p)", jobj);
                 dvmAbort();
             }
@@ -362,7 +351,7 @@ Object* dvmDecodeIndirectRef(JNIEnv* env, jobject jobj) {
         }
     case kIndirectKindInvalid:
     default:
-        if (gDvmJni.workAroundAppJniBugs) {
+        if (UNLIKELY(gDvmJni.workAroundAppJniBugs)) {
             // Assume an invalid local reference is actually a direct pointer.
             return reinterpret_cast<Object*>(jobj);
         }
@@ -370,6 +359,13 @@ Object* dvmDecodeIndirectRef(JNIEnv* env, jobject jobj) {
         dvmAbort();
         return kInvalidIndirectRefObject;
     }
+}
+
+static void AddLocalReferenceFailure(IndirectRefTable* pRefTable) {
+    pRefTable->dump("JNI local");
+    LOGE("Failed adding to JNI local ref table (has %zd entries)", pRefTable->capacity());
+    dvmDumpThread(dvmThreadSelf(), false);
+    dvmAbort();     // spec says call FatalError; this is equivalent
 }
 
 /*
@@ -380,47 +376,20 @@ Object* dvmDecodeIndirectRef(JNIEnv* env, jobject jobj) {
  *
  * This will be called on otherwise unreferenced objects.  We cannot do
  * GC allocations here, and it's best if we don't grab a mutex.
- *
- * Returns the local reference (currently just the same pointer that was
- * passed in), or NULL on failure.
  */
-static jobject addLocalReference(JNIEnv* env, Object* obj) {
+static inline jobject addLocalReference(Thread* self, Object* obj) {
     if (obj == NULL) {
         return NULL;
     }
 
-    IndirectRefTable* pRefTable = getLocalRefTable(env);
-    void* curFrame = self(env)->interpSave.curFrame;
+    IndirectRefTable* pRefTable = &self->jniLocalRefTable;
+    void* curFrame = self->interpSave.curFrame;
     u4 cookie = SAVEAREA_FROM_FP(curFrame)->xtra.localRefCookie;
     jobject jobj = (jobject) pRefTable->add(cookie, obj);
-    if (jobj == NULL) {
-        pRefTable->dump("JNI local");
-        LOGE("Failed adding to JNI local ref table (has %zd entries)",
-                pRefTable->capacity());
-        dvmDumpThread(dvmThreadSelf(), false);
-        dvmAbort();     // spec says call FatalError; this is equivalent
-    } else {
-        if (false) {
-            LOGI("LREF add %p  (%s.%s) (ent=%zd)", obj,
-                    dvmGetCurrentJNIMethod()->clazz->descriptor,
-                    dvmGetCurrentJNIMethod()->name,
-                    pRefTable->capacity());
-        }
+    if (UNLIKELY(jobj == NULL)) {
+        AddLocalReferenceFailure(pRefTable);
     }
-
-#if 0 // TODO: fix this to understand PushLocalFrame, so we can turn it on.
-    if (gDvmJni.useCheckJni) {
-        size_t entryCount = pRefTable->capacity();
-        if (entryCount > 16) {
-            LOGW("Warning: more than 16 JNI local references: %d (most recent was a %s)", entryCount, obj->clazz->descriptor);
-            pRefTable->dump("JNI local");
-            dvmDumpThread(dvmThreadSelf(), false);
-            //dvmAbort();
-        }
-    }
-#endif
-
-    if (gDvmJni.workAroundAppJniBugs) {
+    if (UNLIKELY(gDvmJni.workAroundAppJniBugs)) {
         // Hand out direct pointers to support broken old apps.
         return reinterpret_cast<jobject>(obj);
     }
@@ -431,9 +400,8 @@ static jobject addLocalReference(JNIEnv* env, Object* obj) {
  * Ensure that at least "capacity" references can be held in the local
  * refs table of the current thread.
  */
-static bool ensureLocalCapacity(JNIEnv* env, int capacity) {
-    IndirectRefTable* pRefTable = getLocalRefTable(env);
-    int numEntries = pRefTable->capacity();
+static bool ensureLocalCapacity(Thread* self, int capacity) {
+    int numEntries = self->jniLocalRefTable.capacity();
     // TODO: this isn't quite right, since "numEntries" includes holes
     return ((kJniLocalRefMax - numEntries) >= capacity);
 }
@@ -441,13 +409,13 @@ static bool ensureLocalCapacity(JNIEnv* env, int capacity) {
 /*
  * Explicitly delete a reference from the local list.
  */
-static void deleteLocalReference(JNIEnv* env, jobject jobj) {
+static void deleteLocalReference(Thread* self, jobject jobj) {
     if (jobj == NULL) {
         return;
     }
 
-    IndirectRefTable* pRefTable = getLocalRefTable(env);
-    void* curFrame = self(env)->interpSave.curFrame;
+    IndirectRefTable* pRefTable = &self->jniLocalRefTable;
+    void* curFrame = self->interpSave.curFrame;
     u4 cookie = SAVEAREA_FROM_FP(curFrame)->xtra.localRefCookie;
     if (!pRefTable->remove(cookie, jobj)) {
         /*
@@ -587,7 +555,9 @@ static jobject addWeakGlobalReference(Object* obj) {
     IndirectRefTable *table = &gDvm.jniWeakGlobalRefTable;
     jobject jobj = (jobject) table->add(IRT_FIRST_SEGMENT, obj);
     if (jobj == NULL) {
+        gDvm.jniWeakGlobalRefTable.dump("JNI weak global");
         LOGE("Failed adding to JNI weak global ref table (%zd entries)", table->capacity());
+        dvmAbort();
     }
     return jobj;
 }
@@ -704,9 +674,7 @@ static void unpinPrimitiveArray(ArrayObject* arrayObj) {
  */
 void dvmDumpJniReferenceTables() {
     Thread* self = dvmThreadSelf();
-    JNIEnv* env = self->jniEnv;
-    IndirectRefTable* pLocalRefs = getLocalRefTable(env);
-    pLocalRefs->dump("JNI local");
+    self->jniLocalRefTable.dump("JNI local");
     gDvm.jniGlobalRefTable.dump("JNI global");
     dvmDumpReferenceTable(&gDvm.jniPinRefTable, "JNI pinned array");
 }
@@ -723,7 +691,7 @@ void dvmDumpJniReferenceTables() {
  *
  * Used by -Xcheck:jni and GetObjectRefType.
  */
-jobjectRefType dvmGetJNIRefType(JNIEnv* env, jobject jobj) {
+jobjectRefType dvmGetJNIRefType(Thread* self, jobject jobj) {
     /*
      * IndirectRefKind is currently defined as an exact match of
      * jobjectRefType, so this is easy.  We have to decode it to determine
@@ -731,11 +699,11 @@ jobjectRefType dvmGetJNIRefType(JNIEnv* env, jobject jobj) {
      */
     assert(jobj != NULL);
 
-    Object* obj = dvmDecodeIndirectRef(env, jobj);
+    Object* obj = dvmDecodeIndirectRef(self, jobj);
     if (obj == reinterpret_cast<Object*>(jobj) && gDvmJni.workAroundAppJniBugs) {
         // If we're handing out direct pointers, check whether 'jobj' is a direct reference
         // to a local reference.
-        return getLocalRefTable(env)->contains(jobj) ? JNILocalRefType : JNIInvalidRefType;
+        return self->jniLocalRefTable.contains(obj) ? JNILocalRefType : JNIInvalidRefType;
     } else if (obj == kInvalidIndirectRefObject) {
         return JNIInvalidRefType;
     } else {
@@ -1141,7 +1109,7 @@ static inline void convertReferenceResult(JNIEnv* env, JValue* pResult,
     const Method* method, Thread* self)
 {
     if (method->shorty[0] == 'L' && !dvmCheckException(self) && pResult->l != NULL) {
-        pResult->l = dvmDecodeIndirectRef(env, (jobject) pResult->l);
+        pResult->l = dvmDecodeIndirectRef(self, (jobject) pResult->l);
     }
 }
 
@@ -1151,10 +1119,9 @@ static inline void convertReferenceResult(JNIEnv* env, JValue* pResult,
 void dvmCallJNIMethod(const u4* args, JValue* pResult, const Method* method, Thread* self) {
     u4* modArgs = (u4*) args;
     jclass staticMethodClass = NULL;
-    JNIEnv* env = self->jniEnv;
 
-    bool isSynchronized = dvmIsSynchronizedMethod(method);
-    Object* lockObj;
+    u4 accessFlags = method->accessFlags;
+    bool isSynchronized = (accessFlags & ACC_SYNCHRONIZED) != 0;
 
     //LOGI("JNI calling %p (%s.%s:%s):", method->insns,
     //    method->clazz->descriptor, method->name, method->shorty);
@@ -1164,26 +1131,15 @@ void dvmCallJNIMethod(const u4* args, JValue* pResult, const Method* method, Thr
      * arguments.
      */
     int idx = 0;
-    if (dvmIsStaticMethod(method)) {
+    Object* lockObj;
+    if ((accessFlags & ACC_STATIC) != 0) {
         lockObj = (Object*) method->clazz;
-
         /* add the class object we pass in */
-        staticMethodClass = (jclass) addLocalReference(env, (Object*) method->clazz);
-        if (staticMethodClass == NULL) {
-            assert(dvmCheckException(self));
-            return;
-        }
+        staticMethodClass = (jclass) addLocalReference(self, (Object*) method->clazz);
     } else {
         lockObj = (Object*) args[0];
-
         /* add "this" */
-        jobject thisObj = addLocalReference(env, (Object*) modArgs[0]);
-        if (thisObj == NULL) {
-            assert(dvmCheckException(self));
-            return;
-        }
-        modArgs[idx] = (u4) thisObj;
-        idx = 1;
+        modArgs[idx++] = (u4) addLocalReference(self, (Object*) modArgs[0]);
     }
 
     if (!method->noRef) {
@@ -1193,12 +1149,7 @@ void dvmCallJNIMethod(const u4* args, JValue* pResult, const Method* method, Thr
             case 'L':
                 //LOGI("  local %d: 0x%08x", idx, modArgs[idx]);
                 if (modArgs[idx] != 0) {
-                    jobject argObj = addLocalReference(env, (Object*) modArgs[idx]);
-                    if (argObj == NULL) {
-                        assert(dvmCheckException(self));
-                        return;
-                    }
-                    modArgs[idx] = (u4) argObj;
+                    modArgs[idx] = (u4) addLocalReference(self, (Object*) modArgs[idx]);
                 }
                 break;
             case 'D':
@@ -1213,10 +1164,10 @@ void dvmCallJNIMethod(const u4* args, JValue* pResult, const Method* method, Thr
         }
     }
 
-    if (method->shouldTrace) {
+    if (UNLIKELY(method->shouldTrace)) {
         logNativeMethodEntry(method, args);
     }
-    if (isSynchronized) {
+    if (UNLIKELY(isSynchronized)) {
         dvmLockObject(self, lockObj);
     }
 
@@ -1225,8 +1176,9 @@ void dvmCallJNIMethod(const u4* args, JValue* pResult, const Method* method, Thr
     ANDROID_MEMBAR_FULL();      /* guarantee ordering on method->insns */
     assert(method->insns != NULL);
 
+    JNIEnv* env = self->jniEnv;
     COMPUTE_STACK_SUM(self);
-    dvmPlatformInvoke(method->fastJni ? NULL : env,
+    dvmPlatformInvoke(env,
             (ClassObject*) staticMethodClass,
             method->jniArgInfo, method->insSize, modArgs, method->shorty,
             (void*) method->insns, pResult);
@@ -1236,19 +1188,12 @@ void dvmCallJNIMethod(const u4* args, JValue* pResult, const Method* method, Thr
 
     convertReferenceResult(env, pResult, method, self);
 
-    if (isSynchronized) {
+    if (UNLIKELY(isSynchronized)) {
         dvmUnlockObject(self, lockObj);
     }
-    if (method->shouldTrace) {
+    if (UNLIKELY(method->shouldTrace)) {
         logNativeMethodExit(method, self, *pResult);
     }
-}
-
-/*
- * Extract the return type enum from the "jniArgInfo" field.
- */
-DalvikJniReturnType dvmGetArgInfoReturnType(int jniArgInfo) {
-    return static_cast<DalvikJniReturnType>((jniArgInfo & DALVIK_JNI_RETURN_MASK) >> DALVIK_JNI_RETURN_SHIFT);
 }
 
 /*
@@ -1333,7 +1278,7 @@ static jclass FindClass(JNIEnv* env, const char* name) {
     ClassObject* clazz = dvmFindClassNoInit(descriptor, loader);
     free(descriptor);
 
-    jclass jclazz = (jclass) addLocalReference(env, (Object*) clazz);
+    jclass jclazz = (jclass) addLocalReference(ts.self(), (Object*) clazz);
     dvmReleaseTrackedAlloc(trackedLoader, ts.self());
     return jclazz;
 }
@@ -1343,8 +1288,8 @@ static jclass FindClass(JNIEnv* env, const char* name) {
  */
 static jclass GetSuperclass(JNIEnv* env, jclass jclazz) {
     ScopedJniThreadState ts(env);
-    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(env, jclazz);
-    return (jclass) addLocalReference(env, (Object*)clazz->super);
+    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jclazz);
+    return (jclass) addLocalReference(ts.self(), (Object*)clazz->super);
 }
 
 /*
@@ -1354,8 +1299,8 @@ static jclass GetSuperclass(JNIEnv* env, jclass jclazz) {
  */
 static jboolean IsAssignableFrom(JNIEnv* env, jclass jclazz1, jclass jclazz2) {
     ScopedJniThreadState ts(env);
-    ClassObject* clazz1 = (ClassObject*) dvmDecodeIndirectRef(env, jclazz1);
-    ClassObject* clazz2 = (ClassObject*) dvmDecodeIndirectRef(env, jclazz2);
+    ClassObject* clazz1 = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jclazz1);
+    ClassObject* clazz2 = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jclazz2);
     return dvmInstanceof(clazz1, clazz2);
 }
 
@@ -1364,7 +1309,7 @@ static jboolean IsAssignableFrom(JNIEnv* env, jclass jclazz1, jclass jclazz2) {
  */
 static jmethodID FromReflectedMethod(JNIEnv* env, jobject jmethod) {
     ScopedJniThreadState ts(env);
-    Object* method = dvmDecodeIndirectRef(env, jmethod);
+    Object* method = dvmDecodeIndirectRef(ts.self(), jmethod);
     return (jmethodID) dvmGetMethodFromReflectObj(method);
 }
 
@@ -1373,7 +1318,7 @@ static jmethodID FromReflectedMethod(JNIEnv* env, jobject jmethod) {
  */
 static jfieldID FromReflectedField(JNIEnv* env, jobject jfield) {
     ScopedJniThreadState ts(env);
-    Object* field = dvmDecodeIndirectRef(env, jfield);
+    Object* field = dvmDecodeIndirectRef(ts.self(), jfield);
     return (jfieldID) dvmGetFieldFromReflectObj(field);
 }
 
@@ -1386,10 +1331,10 @@ static jfieldID FromReflectedField(JNIEnv* env, jobject jfield) {
  */
 static jobject ToReflectedMethod(JNIEnv* env, jclass jcls, jmethodID methodID, jboolean isStatic) {
     ScopedJniThreadState ts(env);
-    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(env, jcls);
+    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jcls);
     Object* obj = dvmCreateReflectObjForMethod(clazz, (Method*) methodID);
     dvmReleaseTrackedAlloc(obj, NULL);
-    return addLocalReference(env, obj);
+    return addLocalReference(ts.self(), obj);
 }
 
 /*
@@ -1401,10 +1346,10 @@ static jobject ToReflectedMethod(JNIEnv* env, jclass jcls, jmethodID methodID, j
  */
 static jobject ToReflectedField(JNIEnv* env, jclass jcls, jfieldID fieldID, jboolean isStatic) {
     ScopedJniThreadState ts(env);
-    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(env, jcls);
+    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jcls);
     Object* obj = dvmCreateReflectObjForField(clazz, (Field*) fieldID);
     dvmReleaseTrackedAlloc(obj, NULL);
-    return addLocalReference(env, obj);
+    return addLocalReference(ts.self(), obj);
 }
 
 /*
@@ -1413,7 +1358,7 @@ static jobject ToReflectedField(JNIEnv* env, jclass jcls, jfieldID fieldID, jboo
 static jint Throw(JNIEnv* env, jthrowable jobj) {
     ScopedJniThreadState ts(env);
     if (jobj != NULL) {
-        Object* obj = dvmDecodeIndirectRef(env, jobj);
+        Object* obj = dvmDecodeIndirectRef(ts.self(), jobj);
         dvmSetException(ts.self(), obj);
         return JNI_OK;
     }
@@ -1426,7 +1371,7 @@ static jint Throw(JNIEnv* env, jthrowable jobj) {
  */
 static jint ThrowNew(JNIEnv* env, jclass jclazz, const char* message) {
     ScopedJniThreadState ts(env);
-    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(env, jclazz);
+    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jclazz);
     dvmThrowException(clazz, message);
     // TODO: should return failure if this didn't work (e.g. OOM)
     return JNI_OK;
@@ -1443,7 +1388,7 @@ static jint ThrowNew(JNIEnv* env, jclass jclazz, const char* message) {
 static jthrowable ExceptionOccurred(JNIEnv* env) {
     ScopedJniThreadState ts(env);
     Object* exception = dvmGetException(ts.self());
-    jthrowable localException = (jthrowable) addLocalReference(env, exception);
+    jthrowable localException = (jthrowable) addLocalReference(ts.self(), exception);
     if (localException == NULL && exception != NULL) {
         /*
          * We were unable to add a new local reference, and threw a new
@@ -1497,7 +1442,7 @@ static void FatalError(JNIEnv* env, const char* msg) {
  */
 static jint PushLocalFrame(JNIEnv* env, jint capacity) {
     ScopedJniThreadState ts(env);
-    if (!ensureLocalCapacity(env, capacity) ||
+    if (!ensureLocalCapacity(ts.self(), capacity) ||
             !dvmPushLocalFrame(ts.self(), dvmGetCurrentJNIMethod()))
     {
         /* yes, OutOfMemoryError, not StackOverflowError */
@@ -1514,13 +1459,13 @@ static jint PushLocalFrame(JNIEnv* env, jint capacity) {
  */
 static jobject PopLocalFrame(JNIEnv* env, jobject jresult) {
     ScopedJniThreadState ts(env);
-    Object* result = dvmDecodeIndirectRef(env, jresult);
+    Object* result = dvmDecodeIndirectRef(ts.self(), jresult);
     if (!dvmPopLocalFrame(ts.self())) {
         LOGW("JNI WARNING: too many PopLocalFrame calls");
         dvmClearException(ts.self());
         dvmThrowRuntimeException("too many PopLocalFrame calls");
     }
-    return addLocalReference(env, result);
+    return addLocalReference(ts.self(), result);
 }
 
 /*
@@ -1528,7 +1473,7 @@ static jobject PopLocalFrame(JNIEnv* env, jobject jresult) {
  */
 static jobject NewGlobalRef(JNIEnv* env, jobject jobj) {
     ScopedJniThreadState ts(env);
-    Object* obj = dvmDecodeIndirectRef(env, jobj);
+    Object* obj = dvmDecodeIndirectRef(ts.self(), jobj);
     return addGlobalReference(obj);
 }
 
@@ -1546,8 +1491,8 @@ static void DeleteGlobalRef(JNIEnv* env, jobject jglobalRef) {
  */
 static jobject NewLocalRef(JNIEnv* env, jobject jobj) {
     ScopedJniThreadState ts(env);
-    Object* obj = dvmDecodeIndirectRef(env, jobj);
-    return addLocalReference(env, obj);
+    Object* obj = dvmDecodeIndirectRef(ts.self(), jobj);
+    return addLocalReference(ts.self(), obj);
 }
 
 /*
@@ -1555,7 +1500,7 @@ static jobject NewLocalRef(JNIEnv* env, jobject jobj) {
  */
 static void DeleteLocalRef(JNIEnv* env, jobject jlocalRef) {
     ScopedJniThreadState ts(env);
-    deleteLocalReference(env, jlocalRef);
+    deleteLocalReference(ts.self(), jlocalRef);
 }
 
 /*
@@ -1564,7 +1509,7 @@ static void DeleteLocalRef(JNIEnv* env, jobject jlocalRef) {
  */
 static jint EnsureLocalCapacity(JNIEnv* env, jint capacity) {
     ScopedJniThreadState ts(env);
-    bool okay = ensureLocalCapacity(env, capacity);
+    bool okay = ensureLocalCapacity(ts.self(), capacity);
     if (!okay) {
         dvmThrowOutOfMemoryError("can't ensure local reference capacity");
     }
@@ -1577,8 +1522,8 @@ static jint EnsureLocalCapacity(JNIEnv* env, jint capacity) {
  */
 static jboolean IsSameObject(JNIEnv* env, jobject jref1, jobject jref2) {
     ScopedJniThreadState ts(env);
-    Object* obj1 = dvmDecodeIndirectRef(env, jref1);
-    Object* obj2 = dvmDecodeIndirectRef(env, jref2);
+    Object* obj1 = dvmDecodeIndirectRef(ts.self(), jref1);
+    Object* obj2 = dvmDecodeIndirectRef(ts.self(), jref2);
     return (obj1 == obj2);
 }
 
@@ -1588,7 +1533,7 @@ static jboolean IsSameObject(JNIEnv* env, jobject jref1, jobject jref2) {
 static jobject AllocObject(JNIEnv* env, jclass jclazz) {
     ScopedJniThreadState ts(env);
 
-    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(env, jclazz);
+    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jclazz);
     if (!canAllocClass(clazz) ||
         (!dvmIsClassInitialized(clazz) && !dvmInitClass(clazz)))
     {
@@ -1597,7 +1542,7 @@ static jobject AllocObject(JNIEnv* env, jclass jclazz) {
     }
 
     Object* newObj = dvmAllocObject(clazz, ALLOC_DONT_TRACK);
-    return addLocalReference(env, newObj);
+    return addLocalReference(ts.self(), newObj);
 }
 
 /*
@@ -1605,7 +1550,7 @@ static jobject AllocObject(JNIEnv* env, jclass jclazz) {
  */
 static jobject NewObject(JNIEnv* env, jclass jclazz, jmethodID methodID, ...) {
     ScopedJniThreadState ts(env);
-    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(env, jclazz);
+    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jclazz);
 
     if (!canAllocClass(clazz) || (!dvmIsClassInitialized(clazz) && !dvmInitClass(clazz))) {
         assert(dvmCheckException(ts.self()));
@@ -1613,7 +1558,7 @@ static jobject NewObject(JNIEnv* env, jclass jclazz, jmethodID methodID, ...) {
     }
 
     Object* newObj = dvmAllocObject(clazz, ALLOC_DONT_TRACK);
-    jobject result = addLocalReference(env, newObj);
+    jobject result = addLocalReference(ts.self(), newObj);
     if (newObj != NULL) {
         JValue unused;
         va_list args;
@@ -1626,7 +1571,7 @@ static jobject NewObject(JNIEnv* env, jclass jclazz, jmethodID methodID, ...) {
 
 static jobject NewObjectV(JNIEnv* env, jclass jclazz, jmethodID methodID, va_list args) {
     ScopedJniThreadState ts(env);
-    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(env, jclazz);
+    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jclazz);
 
     if (!canAllocClass(clazz) || (!dvmIsClassInitialized(clazz) && !dvmInitClass(clazz))) {
         assert(dvmCheckException(ts.self()));
@@ -1634,7 +1579,7 @@ static jobject NewObjectV(JNIEnv* env, jclass jclazz, jmethodID methodID, va_lis
     }
 
     Object* newObj = dvmAllocObject(clazz, ALLOC_DONT_TRACK);
-    jobject result = addLocalReference(env, newObj);
+    jobject result = addLocalReference(ts.self(), newObj);
     if (newObj != NULL) {
         JValue unused;
         dvmCallMethodV(ts.self(), (Method*) methodID, newObj, true, &unused, args);
@@ -1644,7 +1589,7 @@ static jobject NewObjectV(JNIEnv* env, jclass jclazz, jmethodID methodID, va_lis
 
 static jobject NewObjectA(JNIEnv* env, jclass jclazz, jmethodID methodID, jvalue* args) {
     ScopedJniThreadState ts(env);
-    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(env, jclazz);
+    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jclazz);
 
     if (!canAllocClass(clazz) || (!dvmIsClassInitialized(clazz) && !dvmInitClass(clazz))) {
         assert(dvmCheckException(ts.self()));
@@ -1652,7 +1597,7 @@ static jobject NewObjectA(JNIEnv* env, jclass jclazz, jmethodID methodID, jvalue
     }
 
     Object* newObj = dvmAllocObject(clazz, ALLOC_DONT_TRACK);
-    jobject result = addLocalReference(env, newObj);
+    jobject result = addLocalReference(ts.self(), newObj);
     if (newObj != NULL) {
         JValue unused;
         dvmCallMethodA(ts.self(), (Method*) methodID, newObj, true, &unused, args);
@@ -1670,8 +1615,8 @@ static jclass GetObjectClass(JNIEnv* env, jobject jobj) {
 
     assert(jobj != NULL);
 
-    Object* obj = dvmDecodeIndirectRef(env, jobj);
-    return (jclass) addLocalReference(env, (Object*) obj->clazz);
+    Object* obj = dvmDecodeIndirectRef(ts.self(), jobj);
+    return (jclass) addLocalReference(ts.self(), (Object*) obj->clazz);
 }
 
 /*
@@ -1685,8 +1630,8 @@ static jboolean IsInstanceOf(JNIEnv* env, jobject jobj, jclass jclazz) {
         return true;
     }
 
-    Object* obj = dvmDecodeIndirectRef(env, jobj);
-    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(env, jclazz);
+    Object* obj = dvmDecodeIndirectRef(ts.self(), jobj);
+    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jclazz);
     return dvmInstanceof(obj->clazz, clazz);
 }
 
@@ -1707,7 +1652,7 @@ static jboolean IsInstanceOf(JNIEnv* env, jobject jobj, jclass jclazz) {
 static jmethodID GetMethodID(JNIEnv* env, jclass jclazz, const char* name, const char* sig) {
     ScopedJniThreadState ts(env);
 
-    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(env, jclazz);
+    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jclazz);
     if (!dvmIsClassInitialized(clazz) && !dvmInitClass(clazz)) {
         assert(dvmCheckException(ts.self()));
     } else if (dvmIsInterfaceClass(clazz)) {
@@ -1754,7 +1699,7 @@ static jmethodID GetMethodID(JNIEnv* env, jclass jclazz, const char* name, const
 static jfieldID GetFieldID(JNIEnv* env, jclass jclazz, const char* name, const char* sig) {
     ScopedJniThreadState ts(env);
 
-    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(env, jclazz);
+    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jclazz);
 
     if (!dvmIsClassInitialized(clazz) && !dvmInitClass(clazz)) {
         assert(dvmCheckException(ts.self()));
@@ -1776,7 +1721,7 @@ static jfieldID GetFieldID(JNIEnv* env, jclass jclazz, const char* name, const c
 static jmethodID GetStaticMethodID(JNIEnv* env, jclass jclazz, const char* name, const char* sig) {
     ScopedJniThreadState ts(env);
 
-    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(env, jclazz);
+    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jclazz);
     if (!dvmIsClassInitialized(clazz) && !dvmInitClass(clazz)) {
         assert(dvmCheckException(ts.self()));
         return NULL;
@@ -1810,7 +1755,7 @@ static jmethodID GetStaticMethodID(JNIEnv* env, jclass jclazz, const char* name,
 static jfieldID GetStaticFieldID(JNIEnv* env, jclass jclazz, const char* name, const char* sig) {
     ScopedJniThreadState ts(env);
 
-    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(env, jclazz);
+    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jclazz);
     if (!dvmIsClassInitialized(clazz) && !dvmInitClass(clazz)) {
         assert(dvmCheckException(ts.self()));
         return NULL;
@@ -1841,14 +1786,14 @@ static jfieldID GetStaticFieldID(JNIEnv* env, jclass jclazz, const char* name, c
         if (dvmIsVolatileField(sfield)) {                                   \
             if (_isref) {   /* only when _ctype==jobject */                 \
                 Object* obj = dvmGetStaticFieldObjectVolatile(sfield);      \
-                value = (_ctype)(u4)addLocalReference(env, obj);            \
+                value = (_ctype)(u4)addLocalReference(ts.self(), obj);            \
             } else {                                                        \
                 value = (_ctype) dvmGetStaticField##_jname##Volatile(sfield);\
             }                                                               \
         } else {                                                            \
             if (_isref) {                                                   \
                 Object* obj = dvmGetStaticFieldObject(sfield);              \
-                value = (_ctype)(u4)addLocalReference(env, obj);            \
+                value = (_ctype)(u4)addLocalReference(ts.self(), obj);            \
             } else {                                                        \
                 value = (_ctype) dvmGetStaticField##_jname(sfield);         \
             }                                                               \
@@ -1877,16 +1822,14 @@ GET_STATIC_TYPE_FIELD(jdouble, Double, false);
         StaticField* sfield = (StaticField*) fieldID;                       \
         if (dvmIsVolatileField(sfield)) {                                   \
             if (_isref) {   /* only when _ctype==jobject */                 \
-                Object* valObj =                                            \
-                    dvmDecodeIndirectRef(env, (jobject)(u4)value);          \
+                Object* valObj = dvmDecodeIndirectRef(ts.self(), (jobject)(u4)value); \
                 dvmSetStaticFieldObjectVolatile(sfield, valObj);            \
             } else {                                                        \
                 dvmSetStaticField##_jname##Volatile(sfield, (_ctype2)value);\
             }                                                               \
         } else {                                                            \
             if (_isref) {                                                   \
-                Object* valObj =                                            \
-                    dvmDecodeIndirectRef(env, (jobject)(u4)value);          \
+                Object* valObj = dvmDecodeIndirectRef(ts.self(), (jobject)(u4)value); \
                 dvmSetStaticFieldObject(sfield, valObj);                    \
             } else {                                                        \
                 dvmSetStaticField##_jname(sfield, (_ctype2)value);          \
@@ -1913,14 +1856,14 @@ SET_STATIC_TYPE_FIELD(jdouble, double, Double, false);
         jfieldID fieldID)                                                   \
     {                                                                       \
         ScopedJniThreadState ts(env);                                       \
-        Object* obj = dvmDecodeIndirectRef(env, jobj);                      \
+        Object* obj = dvmDecodeIndirectRef(ts.self(), jobj);                      \
         InstField* field = (InstField*) fieldID;                            \
         _ctype value;                                                       \
         if (dvmIsVolatileField(field)) {                            \
             if (_isref) {   /* only when _ctype==jobject */                 \
                 Object* valObj =                                            \
                     dvmGetFieldObjectVolatile(obj, field->byteOffset);      \
-                value = (_ctype)(u4)addLocalReference(env, valObj);         \
+                value = (_ctype)(u4)addLocalReference(ts.self(), valObj);         \
             } else {                                                        \
                 value = (_ctype)                                            \
                     dvmGetField##_jname##Volatile(obj, field->byteOffset);  \
@@ -1928,7 +1871,7 @@ SET_STATIC_TYPE_FIELD(jdouble, double, Double, false);
         } else {                                                            \
             if (_isref) {                                                   \
                 Object* valObj = dvmGetFieldObject(obj, field->byteOffset); \
-                value = (_ctype)(u4)addLocalReference(env, valObj);         \
+                value = (_ctype)(u4)addLocalReference(ts.self(), valObj);         \
             } else {                                                        \
                 value = (_ctype) dvmGetField##_jname(obj, field->byteOffset);\
             }                                                               \
@@ -1953,12 +1896,11 @@ GET_TYPE_FIELD(jdouble, Double, false);
         jfieldID fieldID, _ctype value)                                     \
     {                                                                       \
         ScopedJniThreadState ts(env);                                       \
-        Object* obj = dvmDecodeIndirectRef(env, jobj);                      \
+        Object* obj = dvmDecodeIndirectRef(ts.self(), jobj); \
         InstField* field = (InstField*) fieldID;                            \
         if (dvmIsVolatileField(field)) {                                    \
             if (_isref) {   /* only when _ctype==jobject */                 \
-                Object* valObj =                                            \
-                    dvmDecodeIndirectRef(env, (jobject)(u4)value);          \
+                Object* valObj = dvmDecodeIndirectRef(ts.self(), (jobject)(u4)value); \
                 dvmSetFieldObjectVolatile(obj, field->byteOffset, valObj);  \
             } else {                                                        \
                 dvmSetField##_jname##Volatile(obj,                          \
@@ -1966,8 +1908,7 @@ GET_TYPE_FIELD(jdouble, Double, false);
             }                                                               \
         } else {                                                            \
             if (_isref) {                                                   \
-                Object* valObj =                                            \
-                    dvmDecodeIndirectRef(env, (jobject)(u4)value);          \
+                Object* valObj = dvmDecodeIndirectRef(ts.self(), (jobject)(u4)value); \
                 dvmSetFieldObject(obj, field->byteOffset, valObj);          \
             } else {                                                        \
                 dvmSetField##_jname(obj,                                    \
@@ -1996,7 +1937,7 @@ SET_TYPE_FIELD(jdouble, double, Double, false);
         jmethodID methodID, ...)                                            \
     {                                                                       \
         ScopedJniThreadState ts(env);                                       \
-        Object* obj = dvmDecodeIndirectRef(env, jobj);                      \
+        Object* obj = dvmDecodeIndirectRef(ts.self(), jobj);                      \
         const Method* meth;                                                 \
         va_list args;                                                       \
         JValue result;                                                      \
@@ -2008,14 +1949,14 @@ SET_TYPE_FIELD(jdouble, double, Double, false);
         dvmCallMethodV(ts.self(), meth, obj, true, &result, args);          \
         va_end(args);                                                       \
         if (_isref && !dvmCheckException(ts.self()))                        \
-            result.l = (Object*)addLocalReference(env, result.l);           \
+            result.l = (Object*)addLocalReference(ts.self(), result.l);           \
         return _retok;                                                      \
     }                                                                       \
     static _ctype Call##_jname##MethodV(JNIEnv* env, jobject jobj,          \
         jmethodID methodID, va_list args)                                   \
     {                                                                       \
         ScopedJniThreadState ts(env);                                       \
-        Object* obj = dvmDecodeIndirectRef(env, jobj);                      \
+        Object* obj = dvmDecodeIndirectRef(ts.self(), jobj);                      \
         const Method* meth;                                                 \
         JValue result;                                                      \
         meth = dvmGetVirtualizedMethod(obj->clazz, (Method*)methodID);      \
@@ -2024,14 +1965,14 @@ SET_TYPE_FIELD(jdouble, double, Double, false);
         }                                                                   \
         dvmCallMethodV(ts.self(), meth, obj, true, &result, args);          \
         if (_isref && !dvmCheckException(ts.self()))                        \
-            result.l = (Object*)addLocalReference(env, result.l);           \
+            result.l = (Object*)addLocalReference(ts.self(), result.l);           \
         return _retok;                                                      \
     }                                                                       \
     static _ctype Call##_jname##MethodA(JNIEnv* env, jobject jobj,          \
         jmethodID methodID, jvalue* args)                                   \
     {                                                                       \
         ScopedJniThreadState ts(env);                                       \
-        Object* obj = dvmDecodeIndirectRef(env, jobj);                      \
+        Object* obj = dvmDecodeIndirectRef(ts.self(), jobj);                      \
         const Method* meth;                                                 \
         JValue result;                                                      \
         meth = dvmGetVirtualizedMethod(obj->clazz, (Method*)methodID);      \
@@ -2040,7 +1981,7 @@ SET_TYPE_FIELD(jdouble, double, Double, false);
         }                                                                   \
         dvmCallMethodA(ts.self(), meth, obj, true, &result, args);          \
         if (_isref && !dvmCheckException(ts.self()))                        \
-            result.l = (Object*)addLocalReference(env, result.l);           \
+            result.l = (Object*)addLocalReference(ts.self(), result.l);           \
         return _retok;                                                      \
     }
 CALL_VIRTUAL(jobject, Object, NULL, (jobject) result.l, true);
@@ -2066,9 +2007,8 @@ CALL_VIRTUAL(void, Void, , , false);
         jclass jclazz, jmethodID methodID, ...)                             \
     {                                                                       \
         ScopedJniThreadState ts(env);                                       \
-        Object* obj = dvmDecodeIndirectRef(env, jobj);                      \
-        ClassObject* clazz =                                                \
-            (ClassObject*) dvmDecodeIndirectRef(env, jclazz);               \
+        Object* obj = dvmDecodeIndirectRef(ts.self(), jobj);                      \
+        ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jclazz); \
         const Method* meth;                                                 \
         va_list args;                                                       \
         JValue result;                                                      \
@@ -2079,7 +2019,7 @@ CALL_VIRTUAL(void, Void, , , false);
         va_start(args, methodID);                                           \
         dvmCallMethodV(ts.self(), meth, obj, true, &result, args);          \
         if (_isref && !dvmCheckException(ts.self()))                        \
-            result.l = (Object*)addLocalReference(env, result.l);           \
+            result.l = (Object*)addLocalReference(ts.self(), result.l);           \
         va_end(args);                                                       \
         return _retok;                                                      \
     }                                                                       \
@@ -2087,9 +2027,8 @@ CALL_VIRTUAL(void, Void, , , false);
         jclass jclazz, jmethodID methodID, va_list args)                    \
     {                                                                       \
         ScopedJniThreadState ts(env);                                       \
-        Object* obj = dvmDecodeIndirectRef(env, jobj);                      \
-        ClassObject* clazz =                                                \
-            (ClassObject*) dvmDecodeIndirectRef(env, jclazz);               \
+        Object* obj = dvmDecodeIndirectRef(ts.self(), jobj);                      \
+        ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jclazz); \
         const Method* meth;                                                 \
         JValue result;                                                      \
         meth = dvmGetVirtualizedMethod(clazz, (Method*)methodID);           \
@@ -2098,16 +2037,15 @@ CALL_VIRTUAL(void, Void, , , false);
         }                                                                   \
         dvmCallMethodV(ts.self(), meth, obj, true, &result, args);          \
         if (_isref && !dvmCheckException(ts.self()))                        \
-            result.l = (Object*)addLocalReference(env, result.l);           \
+            result.l = (Object*)addLocalReference(ts.self(), result.l);           \
         return _retok;                                                      \
     }                                                                       \
     static _ctype CallNonvirtual##_jname##MethodA(JNIEnv* env, jobject jobj,\
         jclass jclazz, jmethodID methodID, jvalue* args)                    \
     {                                                                       \
         ScopedJniThreadState ts(env);                                       \
-        Object* obj = dvmDecodeIndirectRef(env, jobj);                      \
-        ClassObject* clazz =                                                \
-            (ClassObject*) dvmDecodeIndirectRef(env, jclazz);               \
+        Object* obj = dvmDecodeIndirectRef(ts.self(), jobj); \
+        ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jclazz); \
         const Method* meth;                                                 \
         JValue result;                                                      \
         meth = dvmGetVirtualizedMethod(clazz, (Method*)methodID);           \
@@ -2116,7 +2054,7 @@ CALL_VIRTUAL(void, Void, , , false);
         }                                                                   \
         dvmCallMethodA(ts.self(), meth, obj, true, &result, args);          \
         if (_isref && !dvmCheckException(ts.self()))                        \
-            result.l = (Object*)addLocalReference(env, result.l);           \
+            result.l = (Object*)addLocalReference(ts.self(), result.l);           \
         return _retok;                                                      \
     }
 CALL_NONVIRTUAL(jobject, Object, NULL, (jobject) result.l, true);
@@ -2146,7 +2084,7 @@ CALL_NONVIRTUAL(void, Void, , , false);
         dvmCallMethodV(ts.self(), (Method*)methodID, NULL, true, &result, args);\
         va_end(args);                                                       \
         if (_isref && !dvmCheckException(ts.self()))                        \
-            result.l = (Object*)addLocalReference(env, result.l);           \
+            result.l = (Object*)addLocalReference(ts.self(), result.l);           \
         return _retok;                                                      \
     }                                                                       \
     static _ctype CallStatic##_jname##MethodV(JNIEnv* env, jclass jclazz,   \
@@ -2157,7 +2095,7 @@ CALL_NONVIRTUAL(void, Void, , , false);
         JValue result;                                                      \
         dvmCallMethodV(ts.self(), (Method*)methodID, NULL, true, &result, args);\
         if (_isref && !dvmCheckException(ts.self()))                        \
-            result.l = (Object*)addLocalReference(env, result.l);           \
+            result.l = (Object*)addLocalReference(ts.self(), result.l);           \
         return _retok;                                                      \
     }                                                                       \
     static _ctype CallStatic##_jname##MethodA(JNIEnv* env, jclass jclazz,   \
@@ -2168,7 +2106,7 @@ CALL_NONVIRTUAL(void, Void, , , false);
         JValue result;                                                      \
         dvmCallMethodA(ts.self(), (Method*)methodID, NULL, true, &result, args);\
         if (_isref && !dvmCheckException(ts.self()))                        \
-            result.l = (Object*)addLocalReference(env, result.l);           \
+            result.l = (Object*)addLocalReference(ts.self(), result.l);           \
         return _retok;                                                      \
     }
 CALL_STATIC(jobject, Object, NULL, (jobject) result.l, true);
@@ -2195,7 +2133,7 @@ static jstring NewString(JNIEnv* env, const jchar* unicodeChars, jsize len) {
         return NULL;
     }
     dvmReleaseTrackedAlloc((Object*) jstr, NULL);
-    return (jstring) addLocalReference(env, (Object*) jstr);
+    return (jstring) addLocalReference(ts.self(), (Object*) jstr);
 }
 
 /*
@@ -2203,7 +2141,7 @@ static jstring NewString(JNIEnv* env, const jchar* unicodeChars, jsize len) {
  */
 static jsize GetStringLength(JNIEnv* env, jstring jstr) {
     ScopedJniThreadState ts(env);
-    StringObject* strObj = (StringObject*) dvmDecodeIndirectRef(env, jstr);
+    StringObject* strObj = (StringObject*) dvmDecodeIndirectRef(ts.self(), jstr);
     return strObj->length();
 }
 
@@ -2217,7 +2155,7 @@ static jsize GetStringLength(JNIEnv* env, jstring jstr) {
 static const jchar* GetStringChars(JNIEnv* env, jstring jstr, jboolean* isCopy) {
     ScopedJniThreadState ts(env);
 
-    StringObject* strObj = (StringObject*) dvmDecodeIndirectRef(env, jstr);
+    StringObject* strObj = (StringObject*) dvmDecodeIndirectRef(ts.self(), jstr);
     ArrayObject* strChars = strObj->array();
 
     pinPrimitiveArray(strChars);
@@ -2234,7 +2172,7 @@ static const jchar* GetStringChars(JNIEnv* env, jstring jstr, jboolean* isCopy) 
  */
 static void ReleaseStringChars(JNIEnv* env, jstring jstr, const jchar* chars) {
     ScopedJniThreadState ts(env);
-    StringObject* strObj = (StringObject*) dvmDecodeIndirectRef(env, jstr);
+    StringObject* strObj = (StringObject*) dvmDecodeIndirectRef(ts.self(), jstr);
     ArrayObject* strChars = strObj->array();
     unpinPrimitiveArray(strChars);
 }
@@ -2252,7 +2190,7 @@ static jstring NewStringUTF(JNIEnv* env, const char* bytes) {
     }
     /* note newStr could come back NULL on OOM */
     StringObject* newStr = dvmCreateStringFromCstr(bytes);
-    jstring result = (jstring) addLocalReference(env, (Object*) newStr);
+    jstring result = (jstring) addLocalReference(ts.self(), (Object*) newStr);
     dvmReleaseTrackedAlloc((Object*)newStr, NULL);
     return result;
 }
@@ -2262,7 +2200,7 @@ static jstring NewStringUTF(JNIEnv* env, const char* bytes) {
  */
 static jsize GetStringUTFLength(JNIEnv* env, jstring jstr) {
     ScopedJniThreadState ts(env);
-    StringObject* strObj = (StringObject*) dvmDecodeIndirectRef(env, jstr);
+    StringObject* strObj = (StringObject*) dvmDecodeIndirectRef(ts.self(), jstr);
     if (strObj == NULL) {
         return 0; // Should we throw something or assert?
     }
@@ -2292,7 +2230,7 @@ static const char* GetStringUTFChars(JNIEnv* env, jstring jstr, jboolean* isCopy
     if (isCopy != NULL) {
         *isCopy = JNI_TRUE;
     }
-    StringObject* strObj = (StringObject*) dvmDecodeIndirectRef(env, jstr);
+    StringObject* strObj = (StringObject*) dvmDecodeIndirectRef(ts.self(), jstr);
     char* newStr = dvmCreateCstrFromString(strObj);
     if (newStr == NULL) {
         /* assume memory failure */
@@ -2314,7 +2252,7 @@ static void ReleaseStringUTFChars(JNIEnv* env, jstring jstr, const char* utf) {
  */
 static jsize GetArrayLength(JNIEnv* env, jarray jarr) {
     ScopedJniThreadState ts(env);
-    ArrayObject* arrObj = (ArrayObject*) dvmDecodeIndirectRef(env, jarr);
+    ArrayObject* arrObj = (ArrayObject*) dvmDecodeIndirectRef(ts.self(), jarr);
     return arrObj->length;
 }
 
@@ -2331,21 +2269,21 @@ static jobjectArray NewObjectArray(JNIEnv* env, jsize length,
         return NULL;
     }
 
-    ClassObject* elemClassObj = (ClassObject*) dvmDecodeIndirectRef(env, jelementClass);
+    ClassObject* elemClassObj = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jelementClass);
     ClassObject* arrayClass = dvmFindArrayClassForElement(elemClassObj);
     ArrayObject* newObj = dvmAllocArrayByClass(arrayClass, length, ALLOC_DEFAULT);
     if (newObj == NULL) {
         assert(dvmCheckException(ts.self()));
         return NULL;
     }
-    jobjectArray newArray = (jobjectArray) addLocalReference(env, (Object*) newObj);
+    jobjectArray newArray = (jobjectArray) addLocalReference(ts.self(), (Object*) newObj);
     dvmReleaseTrackedAlloc((Object*) newObj, NULL);
 
     /*
      * Initialize the array.
      */
     if (jinitialElement != NULL) {
-        Object* initialElement = dvmDecodeIndirectRef(env, jinitialElement);
+        Object* initialElement = dvmDecodeIndirectRef(ts.self(), jinitialElement);
         Object** arrayData = (Object**) (void*) newObj->contents;
         for (jsize i = 0; i < length; ++i) {
             arrayData[i] = initialElement;
@@ -2372,13 +2310,13 @@ static bool checkArrayElementBounds(ArrayObject* arrayObj, jsize index) {
 static jobject GetObjectArrayElement(JNIEnv* env, jobjectArray jarr, jsize index) {
     ScopedJniThreadState ts(env);
 
-    ArrayObject* arrayObj = (ArrayObject*) dvmDecodeIndirectRef(env, jarr);
+    ArrayObject* arrayObj = (ArrayObject*) dvmDecodeIndirectRef(ts.self(), jarr);
     if (!checkArrayElementBounds(arrayObj, index)) {
         return NULL;
     }
 
     Object* value = ((Object**) (void*) arrayObj->contents)[index];
-    return addLocalReference(env, value);
+    return addLocalReference(ts.self(), value);
 }
 
 /*
@@ -2387,14 +2325,14 @@ static jobject GetObjectArrayElement(JNIEnv* env, jobjectArray jarr, jsize index
 static void SetObjectArrayElement(JNIEnv* env, jobjectArray jarr, jsize index, jobject jobj) {
     ScopedJniThreadState ts(env);
 
-    ArrayObject* arrayObj = (ArrayObject*) dvmDecodeIndirectRef(env, jarr);
+    ArrayObject* arrayObj = (ArrayObject*) dvmDecodeIndirectRef(ts.self(), jarr);
     if (!checkArrayElementBounds(arrayObj, index)) {
         return;
     }
 
     //LOGV("JNI: set element %d in array %p to %p", index, array, value);
 
-    Object* obj = dvmDecodeIndirectRef(env, jobj);
+    Object* obj = dvmDecodeIndirectRef(ts.self(), jobj);
     dvmSetObjectArrayElement(arrayObj, index, obj);
 }
 
@@ -2408,7 +2346,7 @@ static void SetObjectArrayElement(JNIEnv* env, jobjectArray jarr, jsize index, j
         if (arrayObj == NULL) { \
             return NULL; \
         } \
-        _artype result = (_artype) addLocalReference(env, (Object*) arrayObj); \
+        _artype result = (_artype) addLocalReference(ts.self(), (Object*) arrayObj); \
         dvmReleaseTrackedAlloc((Object*) arrayObj, NULL); \
         return result; \
     }
@@ -2435,7 +2373,7 @@ NEW_PRIMITIVE_ARRAY(jdoubleArray, Double, 'D');
         _ctype##Array jarr, jboolean* isCopy) \
     { \
         ScopedJniThreadState ts(env); \
-        ArrayObject* arrayObj = (ArrayObject*) dvmDecodeIndirectRef(env, jarr); \
+        ArrayObject* arrayObj = (ArrayObject*) dvmDecodeIndirectRef(ts.self(), jarr); \
         pinPrimitiveArray(arrayObj); \
         _ctype* data = (_ctype*) (void*) arrayObj->contents; \
         if (isCopy != NULL) { \
@@ -2458,8 +2396,7 @@ NEW_PRIMITIVE_ARRAY(jdoubleArray, Double, 'D');
         UNUSED_PARAMETER(elems);                                            \
         if (mode != JNI_COMMIT) {                                           \
             ScopedJniThreadState ts(env);                                   \
-            ArrayObject* arrayObj =                                         \
-                (ArrayObject*) dvmDecodeIndirectRef(env, jarr);             \
+            ArrayObject* arrayObj = (ArrayObject*) dvmDecodeIndirectRef(ts.self(), jarr); \
             unpinPrimitiveArray(arrayObj);                                  \
         }                                                                   \
     }
@@ -2481,7 +2418,7 @@ static void throwArrayRegionOutOfBounds(ArrayObject* arrayObj, jsize start,
         _ctype##Array jarr, jsize start, jsize len, _ctype* buf) \
     { \
         ScopedJniThreadState ts(env); \
-        ArrayObject* arrayObj = (ArrayObject*) dvmDecodeIndirectRef(env, jarr); \
+        ArrayObject* arrayObj = (ArrayObject*) dvmDecodeIndirectRef(ts.self(), jarr); \
         _ctype* data = (_ctype*) (void*) arrayObj->contents; \
         if (start < 0 || len < 0 || start + len > (int) arrayObj->length) { \
             throwArrayRegionOutOfBounds(arrayObj, start, len, "src"); \
@@ -2498,7 +2435,7 @@ static void throwArrayRegionOutOfBounds(ArrayObject* arrayObj, jsize start,
         _ctype##Array jarr, jsize start, jsize len, const _ctype* buf) \
     { \
         ScopedJniThreadState ts(env); \
-        ArrayObject* arrayObj = (ArrayObject*) dvmDecodeIndirectRef(env, jarr); \
+        ArrayObject* arrayObj = (ArrayObject*) dvmDecodeIndirectRef(ts.self(), jarr); \
         _ctype* data = (_ctype*) (void*) arrayObj->contents; \
         if (start < 0 || len < 0 || start + len > (int) arrayObj->length) { \
             throwArrayRegionOutOfBounds(arrayObj, start, len, "dst"); \
@@ -2540,7 +2477,7 @@ static jint RegisterNatives(JNIEnv* env, jclass jclazz,
 {
     ScopedJniThreadState ts(env);
 
-    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(env, jclazz);
+    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jclazz);
 
     if (gDvm.verboseJni) {
         LOGI("[Registering JNI native methods for class %s]",
@@ -2586,7 +2523,7 @@ static jint RegisterNatives(JNIEnv* env, jclass jclazz,
 static jint UnregisterNatives(JNIEnv* env, jclass jclazz) {
     ScopedJniThreadState ts(env);
 
-    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(env, jclazz);
+    ClassObject* clazz = (ClassObject*) dvmDecodeIndirectRef(ts.self(), jclazz);
     if (gDvm.verboseJni) {
         LOGI("[Unregistering JNI native methods for class %s]",
             clazz->descriptor);
@@ -2603,7 +2540,7 @@ static jint UnregisterNatives(JNIEnv* env, jclass jclazz) {
  */
 static jint MonitorEnter(JNIEnv* env, jobject jobj) {
     ScopedJniThreadState ts(env);
-    Object* obj = dvmDecodeIndirectRef(env, jobj);
+    Object* obj = dvmDecodeIndirectRef(ts.self(), jobj);
     dvmLockObject(ts.self(), obj);
     trackMonitorEnter(ts.self(), obj);
     return JNI_OK;
@@ -2620,7 +2557,7 @@ static jint MonitorEnter(JNIEnv* env, jobject jobj) {
  */
 static jint MonitorExit(JNIEnv* env, jobject jobj) {
     ScopedJniThreadState ts(env);
-    Object* obj = dvmDecodeIndirectRef(env, jobj);
+    Object* obj = dvmDecodeIndirectRef(ts.self(), jobj);
     bool success = dvmUnlockObject(ts.self(), obj);
     if (success) {
         trackMonitorExit(ts.self(), obj);
@@ -2642,7 +2579,7 @@ static jint GetJavaVM(JNIEnv* env, JavaVM** vm) {
  */
 static void GetStringRegion(JNIEnv* env, jstring jstr, jsize start, jsize len, jchar* buf) {
     ScopedJniThreadState ts(env);
-    StringObject* strObj = (StringObject*) dvmDecodeIndirectRef(env, jstr);
+    StringObject* strObj = (StringObject*) dvmDecodeIndirectRef(ts.self(), jstr);
     int strLen = strObj->length();
     if (((start|len) < 0) || (start + len > strLen)) {
         dvmThrowStringIndexOutOfBoundsExceptionWithRegion(strLen, start, len);
@@ -2657,7 +2594,7 @@ static void GetStringRegion(JNIEnv* env, jstring jstr, jsize start, jsize len, j
  */
 static void GetStringUTFRegion(JNIEnv* env, jstring jstr, jsize start, jsize len, char* buf) {
     ScopedJniThreadState ts(env);
-    StringObject* strObj = (StringObject*) dvmDecodeIndirectRef(env, jstr);
+    StringObject* strObj = (StringObject*) dvmDecodeIndirectRef(ts.self(), jstr);
     int strLen = strObj->length();
     if (((start|len) < 0) || (start + len > strLen)) {
         dvmThrowStringIndexOutOfBoundsExceptionWithRegion(strLen, start, len);
@@ -2676,10 +2613,10 @@ static void GetStringUTFRegion(JNIEnv* env, jstring jstr, jsize start, jsize len
  */
 static void* GetPrimitiveArrayCritical(JNIEnv* env, jarray jarr, jboolean* isCopy) {
     ScopedJniThreadState ts(env);
-    ArrayObject* arrayObj = (ArrayObject*) dvmDecodeIndirectRef(env, jarr);
+    ArrayObject* arrayObj = (ArrayObject*) dvmDecodeIndirectRef(ts.self(), jarr);
     pinPrimitiveArray(arrayObj);
     void* data = arrayObj->contents;
-    if (isCopy != NULL) {
+    if (UNLIKELY(isCopy != NULL)) {
         *isCopy = JNI_FALSE;
     }
     return data;
@@ -2691,7 +2628,7 @@ static void* GetPrimitiveArrayCritical(JNIEnv* env, jarray jarr, jboolean* isCop
 static void ReleasePrimitiveArrayCritical(JNIEnv* env, jarray jarr, void* carray, jint mode) {
     if (mode != JNI_COMMIT) {
         ScopedJniThreadState ts(env);
-        ArrayObject* arrayObj = (ArrayObject*) dvmDecodeIndirectRef(env, jarr);
+        ArrayObject* arrayObj = (ArrayObject*) dvmDecodeIndirectRef(ts.self(), jarr);
         unpinPrimitiveArray(arrayObj);
     }
 }
@@ -2702,7 +2639,7 @@ static void ReleasePrimitiveArrayCritical(JNIEnv* env, jarray jarr, void* carray
 static const jchar* GetStringCritical(JNIEnv* env, jstring jstr, jboolean* isCopy) {
     ScopedJniThreadState ts(env);
 
-    StringObject* strObj = (StringObject*) dvmDecodeIndirectRef(env, jstr);
+    StringObject* strObj = (StringObject*) dvmDecodeIndirectRef(ts.self(), jstr);
     ArrayObject* strChars = strObj->array();
 
     pinPrimitiveArray(strChars);
@@ -2719,7 +2656,7 @@ static const jchar* GetStringCritical(JNIEnv* env, jstring jstr, jboolean* isCop
  */
 static void ReleaseStringCritical(JNIEnv* env, jstring jstr, const jchar* carray) {
     ScopedJniThreadState ts(env);
-    StringObject* strObj = (StringObject*) dvmDecodeIndirectRef(env, jstr);
+    StringObject* strObj = (StringObject*) dvmDecodeIndirectRef(ts.self(), jstr);
     ArrayObject* strChars = strObj->array();
     unpinPrimitiveArray(strChars);
 }
@@ -2729,7 +2666,7 @@ static void ReleaseStringCritical(JNIEnv* env, jstring jstr, const jchar* carray
  */
 static jweak NewWeakGlobalRef(JNIEnv* env, jobject jobj) {
     ScopedJniThreadState ts(env);
-    Object *obj = dvmDecodeIndirectRef(env, jobj);
+    Object *obj = dvmDecodeIndirectRef(ts.self(), jobj);
     return (jweak) addWeakGlobalReference(obj);
 }
 
@@ -2761,7 +2698,7 @@ static jboolean ExceptionCheck(JNIEnv* env) {
  */
 static jobjectRefType GetObjectRefType(JNIEnv* env, jobject jobj) {
     ScopedJniThreadState ts(env);
-    return dvmGetJNIRefType(env, jobj);
+    return dvmGetJNIRefType(ts.self(), jobj);
 }
 
 /*
@@ -2783,12 +2720,12 @@ static jobject NewDirectByteBuffer(JNIEnv* env, void* address, jlong capacity) {
         return NULL;
     }
     /* call the constructor */
-    jobject result = addLocalReference(env, newObj);
+    jobject result = addLocalReference(ts.self(), newObj);
     JValue unused;
     dvmCallMethod(ts.self(), gDvm.methJavaNioReadWriteDirectByteBuffer_init,
             newObj, &unused, (jint) address, (jint) capacity);
     if (dvmGetException(ts.self()) != NULL) {
-        deleteLocalReference(env, result);
+        deleteLocalReference(ts.self(), result);
         return NULL;
     }
     return result;
@@ -2803,7 +2740,7 @@ static void* GetDirectBufferAddress(JNIEnv* env, jobject jbuf) {
     ScopedJniThreadState ts(env);
 
     // All Buffer objects have an effectiveDirectAddress field.
-    Object* bufObj = dvmDecodeIndirectRef(env, jbuf);
+    Object* bufObj = dvmDecodeIndirectRef(ts.self(), jbuf);
     return (void*) dvmGetFieldInt(bufObj, gDvm.offJavaNioBuffer_effectiveDirectAddress);
 }
 
@@ -2823,7 +2760,7 @@ static jlong GetDirectBufferCapacity(JNIEnv* env, jobject jbuf) {
      * (The "check" version should verify that this is actually a Buffer,
      * but we're not required to do so here.)
      */
-    Object* buf = dvmDecodeIndirectRef(env, jbuf);
+    Object* buf = dvmDecodeIndirectRef(ts.self(), jbuf);
     return dvmGetFieldInt(buf, gDvm.offJavaNioBuffer_capacity);
 }
 
