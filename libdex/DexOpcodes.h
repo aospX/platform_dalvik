@@ -581,6 +581,7 @@ enum Opcode {
     OP_SPUT_OBJECT_VOLATILE_JUMBO   = 0x1fe,
     OP_THROW_VERIFICATION_ERROR_JUMBO = 0x1ff,
     // END(libdex-opcode-enum)
+    // Note: The end of this list must match dvmVerifyDex() in vm/compiler/Frontend.cpp
 };
 
 /*

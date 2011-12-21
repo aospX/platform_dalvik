@@ -2740,6 +2740,17 @@ static bool handleFmt22x_Fmt32x(CompilationUnit *cUnit, MIR *mir)
     return false;
 }
 
+/*
+ * Utility funtion to check the DEX opcode in the MIR
+ */
+__attribute__((weak)) bool isInvalidMIR(CompilationUnit *cUnit, MIR *mir)
+{
+    bool result  = false;
+
+    return result;
+}
+
+
 static bool handleFmt23x(CompilationUnit *cUnit, MIR *mir)
 {
     Opcode opcode = mir->dalvikInsn.opcode;
@@ -4488,6 +4499,8 @@ void dvmCompilerMIR2LIR(CompilationUnit *cUnit)
                 if (singleStepMe || cUnit->allSingleStep) {
                     notHandled = false;
                     genInterpSingleStep(cUnit, mir);
+                } else if (isInvalidMIR(cUnit, mir)) {
+                    notHandled = false;
                 } else {
                     opcodeCoverage[dalvikOpcode]++;
                     switch (dalvikFormat) {
@@ -4793,9 +4806,9 @@ bool dvmCompilerArchInit()
     int i;
 
     for (i = 0; i < kArmLast; i++) {
-        if (EncodingMap[i].opcode != i) {
+        if (getEncoding((ArmOpcode)i)->opcode != i) {
             LOGE("Encoding order for %s is wrong: expecting %d, seeing %d",
-                 EncodingMap[i].name, i, EncodingMap[i].opcode);
+                 getEncoding((ArmOpcode)i)->name, i, getEncoding((ArmOpcode)i)->opcode);
             dvmAbort();  // OK to dvmAbort - build error
         }
     }
@@ -4850,3 +4863,47 @@ void dvmCompilerFlushRegWideImpl(CompilationUnit *cUnit, int rBase,
 {
     storeBaseDispWide(cUnit, rBase, displacement, rSrcLo, rSrcHi);
 }
+
+LocalOptsFuncMap localOptsFunMap = {
+
+    handleEasyDivide,
+    handleEasyMultiply,
+    handleExecuteInline,
+    handleExtendedMIR,
+    insertChainingSwitch,
+    isPopCountLE2,
+    isPowerOfTwo,
+    lowestSetBit,
+    markCard,
+    setupLoopEntryBlock,
+    genInterpSingleStep,
+    setMemRefType,
+    annotateDalvikRegAccess,
+    setupResourceMasks,
+    newLIR0,
+    newLIR1,
+    newLIR2,
+    newLIR3,
+#if defined(_ARMV7_A) || defined(_ARMV7_A_NEON)
+    newLIR4,
+#endif
+    inlinedTarget,
+    genCheckCommon,
+    loadWordDisp,
+    storeWordDisp,
+    loadValueDirect,
+    loadValueDirectFixed,
+    loadValueDirectWide,
+    loadValueDirectWideFixed,
+    loadValue,
+    storeValue,
+    loadValueWide,
+    genNullCheck,
+    genRegRegCheck,
+    genZeroCheck,
+    genBoundsCheck,
+    loadConstantNoClobber,
+    loadConstant,
+    storeValueWide,
+};
+
