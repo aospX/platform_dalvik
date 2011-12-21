@@ -129,10 +129,6 @@ bool dvmCreateInlineSubsTable()
              * Not expected.
              * Ignore all extensions
              */
-            LOGE("Unable to find method for inlining: %s.%s:%s",
-                ops[i].classDescriptor, ops[i].methodName,
-                ops[i].methodSignature);
-
             free(table);
             return true;
         }
