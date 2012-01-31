@@ -1587,9 +1587,11 @@ int dvmConvertSSARegToDalvik(const CompilationUnit *cUnit, int ssaReg)
 __attribute__((weak)) int dvmGetDexOptAttributes(int opcode)
 {
     int result = 0;
-    if ((opcode >= OP_NOP) && (opcode <= OP_THROW_VERIFICATION_ERROR_JUMBO)) {
+
+    if ((opcode >= OP_NOP) && (opcode < kMirOpLast)) {
         result = dvmCompilerDataFlowAttributes[opcode];
     }
+
     return result;
 }
 
