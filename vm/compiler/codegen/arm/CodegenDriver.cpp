@@ -5021,5 +5021,10 @@ LocalOptsFuncMap localOptsFunMap = {
     storeBaseIndexed,
     dvmCompilerRegClassBySize,
     encodeShift,
+    opRegReg,
+    opCondBranch,
+    genIT,
+    genBarrier,
+    modifiedImmediate,
 };
 
