@@ -254,6 +254,11 @@ ifeq ($(dvm_arch),arm)
 		compiler/codegen/arm/ArmRallocUtil.cpp \
 		compiler/template/out/CompilerTemplateAsm-$(dvm_arch_variant).S
   endif
+
+  ifeq ($(BOARD_USES_QCOM_HARDWARE),true)
+    LOCAL_WHOLE_STATIC_LIBRARIES += libqc-dalvik
+    LOCAL_SHARED_LIBRARIES += libqc-opt
+  endif
 endif
 
 ifeq ($(dvm_arch),mips)

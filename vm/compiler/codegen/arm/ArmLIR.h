@@ -316,6 +316,7 @@ typedef enum ArmConditionCode {
  * Assemble.c.
  */
 typedef enum ArmOpcode {
+    kArmPseudoPCReconstructionCellExtended = -19,       /* pcReconstruction for extended MIR*/
     kArmChainingCellBottom = -18,
     kArmPseudoBarrier = -17,
     kArmPseudoExtended = -16,
@@ -745,6 +746,7 @@ typedef enum ArmTargetOptHints {
 } ArmTargetOptHints;
 
 extern ArmEncodingMap EncodingMap[kArmLast];
+extern ArmEncodingMap* getEncoding(ArmOpcode opcode);
 
 /*
  * Each instance of this struct holds a pseudo or real LIR instruction:

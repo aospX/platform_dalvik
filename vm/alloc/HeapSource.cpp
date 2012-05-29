@@ -38,7 +38,7 @@ static size_t getMaximumSize(const HeapSource *hs);
 
 #define HEAP_UTILIZATION_MAX        1024
 #define DEFAULT_HEAP_UTILIZATION    512     // Range 1..HEAP_UTILIZATION_MAX
-#define HEAP_IDEAL_FREE             (2 * 1024 * 1024)
+#define HEAP_IDEAL_FREE             (7.2 * 1024 * 1024)
 #define HEAP_MIN_FREE               (HEAP_IDEAL_FREE / 4)
 
 /* How long to wait after a GC before performing a heap trim

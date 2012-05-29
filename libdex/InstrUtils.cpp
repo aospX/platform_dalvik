@@ -1002,11 +1002,13 @@ void dexDecodeInstruction(const u2* insns, DecodedInstruction* pDec)
              */
             switch (count) {
             case 5: {
+#ifndef INLINE_ARG_EXPANDED
                 if (format == kFmt35mi) {
                     /* A fifth arg is verboten for inline invokes. */
                     LOGW("Invalid arg count in 35mi (5)");
                     goto bail;
                 }
+#endif
                 /*
                  * Per note at the top of this format decoder, the
                  * fifth argument comes from the A field in the

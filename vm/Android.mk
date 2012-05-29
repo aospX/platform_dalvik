@@ -39,6 +39,16 @@ else
 endif
 host_smp_flag := -DANDROID_SMP=1
 
+ifeq ($(ARCH_ARM_HAVE_ARMV7A),true)
+    target_inline_arg5_flag := -DINLINE_ARG_EXPANDED
+    host_inline_arg5_flag := -DINLINE_ARG_EXPANDED
+else
+    target_inline_arg5_flag :=
+    host_inline_arg5_flag :=
+endif
+
+
+
 # Build the installed version (libdvm.so) first
 include $(LOCAL_PATH)/ReconfigureDvm.mk
 
@@ -46,6 +56,7 @@ include $(LOCAL_PATH)/ReconfigureDvm.mk
 LOCAL_MODULE_TAGS := optional
 LOCAL_MODULE := libdvm
 LOCAL_CFLAGS += $(target_smp_flag)
+LOCAL_CFLAGS += $(target_inline_arg5_flag)
 include $(BUILD_SHARED_LIBRARY)
 
 # If WITH_JIT is configured, build multiple versions of libdvm.so to facilitate
@@ -59,6 +70,7 @@ ifeq ($(WITH_JIT),true)
     # Enable assertions and JIT-tuning
     LOCAL_CFLAGS += -UNDEBUG -DDEBUG=1 -DLOG_NDEBUG=1 -DWITH_DALVIK_ASSERT \
                     -DWITH_JIT_TUNING $(target_smp_flag)
+    LOCAL_CFLAGS += $(target_inline_arg5_flag)
     LOCAL_MODULE := libdvm_assert
     include $(BUILD_SHARED_LIBRARY)
 
@@ -70,6 +82,7 @@ ifeq ($(WITH_JIT),true)
     # Enable assertions and JIT self-verification
     LOCAL_CFLAGS += -UNDEBUG -DDEBUG=1 -DLOG_NDEBUG=1 -DWITH_DALVIK_ASSERT \
                     -DWITH_SELF_VERIFICATION $(target_smp_flag)
+    LOCAL_CFLAGS += $(target_inline_arg5_flag)
     LOCAL_MODULE := libdvm_sv
     include $(BUILD_SHARED_LIBRARY)
   endif # dvm_arch!=mips
@@ -126,6 +139,7 @@ ifeq ($(WITH_HOST_DALVIK),true)
     endif
 
     LOCAL_CFLAGS += $(host_smp_flag)
+    LOCAL_CFLAGS += $(host_inline_arg5_flag)
     LOCAL_MODULE_TAGS := optional
     LOCAL_MODULE := libdvm
 

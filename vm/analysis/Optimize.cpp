@@ -33,6 +33,7 @@
 struct InlineSub {
     Method* method;
     int     inlineIdx;
+    InlineExtraCheck extraCheck;
 };
 
 
@@ -55,6 +56,11 @@ static bool rewriteExecuteInlineRange(Method* method, u2* insns,
 static void rewriteReturnVoid(Method* method, u2* insns);
 static bool needsReturnBarrier(Method* method);
 
+__attribute__((weak)) Method* dvmFindInlinableMethodEx(const char* classDescriptor,
+    const char* methodName, const char* methodSignature){
+
+    return dvmFindInlinableMethod(classDescriptor, methodName, methodSignature);
+}
 
 /*
  * Create a table of inline substitutions.  Sets gDvm.inlineSubs.
@@ -65,7 +71,7 @@ static bool needsReturnBarrier(Method* method);
 bool dvmCreateInlineSubsTable()
 {
     const InlineOperation* ops = dvmGetInlineOpsTable();
-    const int count = dvmGetInlineOpsTableLength();
+    int count = dvmGetInlineOpsTableLength();
     InlineSub* table;
     int i, tableIndex;
 
@@ -93,6 +99,8 @@ bool dvmCreateInlineSubsTable()
 
         table[tableIndex].method = method;
         table[tableIndex].inlineIdx = i;
+        /* There is no extra check for these */
+        table[tableIndex].extraCheck = 0;
         tableIndex++;
     }
 
@@ -100,6 +108,43 @@ bool dvmCreateInlineSubsTable()
     table[tableIndex].method = NULL;
 
     gDvm.inlineSubs = table;
+
+
+    /* Generate inline extension table if it exists */
+    gDvm.inlineSubsEx = NULL;
+    count = 0;
+    ops = dvmGetInlineOpsTableEx(&count);
+    if (!ops || !count) {
+        return true;
+    }
+
+    /*
+     * One slot per entry, plus an end-of-list marker.
+     */
+    table = (InlineSub*) calloc(count + 1, sizeof(InlineSub));
+
+    tableIndex = 0;
+    for (i = 0; i < count; i++) {
+        Method* method = dvmFindInlinableMethodEx(ops[i].classDescriptor,
+            ops[i].methodName, ops[i].methodSignature);
+        if (method == NULL) {
+            /*
+             * End of ext table
+             */
+            break;
+        }
+
+        table[tableIndex].method = method;
+        table[tableIndex].inlineIdx = i + INLINE_EX_START;
+        table[tableIndex].extraCheck = dvmGetInlineOpExtraCheck(i);
+        tableIndex++;
+    }
+
+    /* mark end of table */
+    table[tableIndex].method = NULL;
+
+    gDvm.inlineSubsEx = table;
+
     return true;
 }
 
@@ -1085,6 +1130,8 @@ static bool rewriteInvokeObjectInit(Method* method, u2* insns)
 
         LOGVV("DexOpt: replaced Object.<init> in %s.%s",
             method->clazz->descriptor, method->name);
+    }else{
+        return false;
     }
 
     return true;
@@ -1202,6 +1249,7 @@ static bool rewriteExecuteInline(Method* method, u2* insns,
     ClassObject* clazz = method->clazz;
     Method* calledMethod;
     u2 methodIdx = insns[1];
+    int inInlineSubsEx = 0;
 
     //return false;
 
@@ -1211,6 +1259,7 @@ static bool rewriteExecuteInline(Method* method, u2* insns,
         return false;
     }
 
+process:
     while (inlineSubs->method != NULL) {
         /*
         if (extra) {
@@ -1222,19 +1271,29 @@ static bool rewriteExecuteInline(Method* method, u2* insns,
         }
         */
         if (inlineSubs->method == calledMethod) {
-            assert((insns[0] & 0xff) == OP_INVOKE_DIRECT ||
-                   (insns[0] & 0xff) == OP_INVOKE_STATIC ||
-                   (insns[0] & 0xff) == OP_INVOKE_VIRTUAL);
-            updateOpcode(method, insns, OP_EXECUTE_INLINE);
-            dvmUpdateCodeUnit(method, insns+1, (u2) inlineSubs->inlineIdx);
+            if ((inlineSubs->extraCheck == 0) ||
+                (inlineSubs->extraCheck(method, calledMethod, insns))) {
+                assert((insns[0] & 0xff) == OP_INVOKE_DIRECT ||
+                       (insns[0] & 0xff) == OP_INVOKE_STATIC ||
+                       (insns[0] & 0xff) == OP_INVOKE_VIRTUAL);
+                updateOpcode(method, insns, OP_EXECUTE_INLINE);
+                dvmUpdateCodeUnit(method, insns+1, (u2) inlineSubs->inlineIdx);
 
-            //LOGI("DexOpt: execute-inline %s.%s --> %s.%s",
-            //    method->clazz->descriptor, method->name,
-            //    calledMethod->clazz->descriptor, calledMethod->name);
-            return true;
+                //LOGI("DexOpt: execute-inline %s.%s --> %s.%s",
+                //    method->clazz->descriptor, method->name,
+                //    calledMethod->clazz->descriptor, calledMethod->name);
+                return true;
+            }
+            return false;
         }
 
         inlineSubs++;
+    }
+
+    if (!inInlineSubsEx && gDvm.inlineSubsEx) {
+        inInlineSubsEx = 1;
+        inlineSubs = gDvm.inlineSubsEx;
+        goto process;
     }
 
     return false;
@@ -1253,6 +1312,7 @@ static bool rewriteExecuteInlineRange(Method* method, u2* insns,
     ClassObject* clazz = method->clazz;
     Method* calledMethod;
     u2 methodIdx = insns[1];
+    int inInlineSubsEx = 0;
 
     calledMethod = dvmOptResolveMethod(clazz, methodIdx, methodType, NULL);
     if (calledMethod == NULL) {
@@ -1260,23 +1320,33 @@ static bool rewriteExecuteInlineRange(Method* method, u2* insns,
         return false;
     }
 
+process:
     while (inlineSubs->method != NULL) {
         if (inlineSubs->method == calledMethod) {
-            assert((insns[0] & 0xff) == OP_INVOKE_DIRECT_RANGE ||
-                   (insns[0] & 0xff) == OP_INVOKE_STATIC_RANGE ||
-                   (insns[0] & 0xff) == OP_INVOKE_VIRTUAL_RANGE);
-            updateOpcode(method, insns, OP_EXECUTE_INLINE_RANGE);
-            dvmUpdateCodeUnit(method, insns+1, (u2) inlineSubs->inlineIdx);
+            if ((inlineSubs->extraCheck == 0) ||
+                (inlineSubs->extraCheck(method, calledMethod, insns))) {
+                assert((insns[0] & 0xff) == OP_INVOKE_DIRECT_RANGE ||
+                       (insns[0] & 0xff) == OP_INVOKE_STATIC_RANGE ||
+                       (insns[0] & 0xff) == OP_INVOKE_VIRTUAL_RANGE);
+                updateOpcode(method, insns, OP_EXECUTE_INLINE_RANGE);
+                dvmUpdateCodeUnit(method, insns+1, (u2) inlineSubs->inlineIdx);
 
-            //LOGI("DexOpt: execute-inline/range %s.%s --> %s.%s",
-            //    method->clazz->descriptor, method->name,
-            //    calledMethod->clazz->descriptor, calledMethod->name);
-            return true;
+                //LOGI("DexOpt: execute-inline/range %s.%s --> %s.%s",
+                //    method->clazz->descriptor, method->name,
+                //    calledMethod->clazz->descriptor, calledMethod->name);
+                return true;
+            }
+            return false;
         }
 
         inlineSubs++;
     }
 
+    if (!inInlineSubsEx && gDvm.inlineSubsEx) {
+        inInlineSubsEx = 1;
+        inlineSubs = gDvm.inlineSubsEx;
+        goto process;
+    }
     return false;
 }
 
